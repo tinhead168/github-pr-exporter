@@ -1,6 +1,7 @@
-// collector.js — v1.6.0
+// collector.js — v1.8.0
 // Extracts all PM-relevant data from GitHub PR pages.
-// Built from live DOM investigation (Feb 2026).
+// Built from live DOM investigation (Feb-Mar 2026).
+// Changelog: v1.7→1.8: Strip suggestion widget UI chrome from body text
 
 (() => {
   "use strict";
@@ -42,12 +43,12 @@
           );
           parts.push("| " + cells.join(" | ") + " |");
         });
-      } else if (tag === "p" || tag === "div" || tag === "a") {
-        const inner = richText(node);
-        if (inner) parts.push(inner);
       } else if (tag === "img") {
         const alt = node.getAttribute("alt");
         if (alt) parts.push(alt);
+      } else if (tag === "p" || tag === "div" || tag === "a") {
+        const inner = richText(node);
+        if (inner) parts.push(inner);
       } else {
         const t = clean(node.textContent);
         if (t) parts.push(t);
@@ -59,37 +60,55 @@
   // ── Permalink builder ───────────────────────────────────────────────
 
   const baseUrl = location.origin + location.pathname;
-
   function makePermalink(elementId) {
     if (!elementId) return null;
     return baseUrl + "#" + elementId;
   }
 
-  // ── 1. PR metadata from embedded JSON ──────────────────────────────
+  // ── 1. PR metadata (embedded JSON + DOM state override) ────────────
 
   function extractMetadata() {
     const script = $('script[data-target="react-app.embeddedData"]');
-    if (!script) return null;
-    try {
-      const data = JSON.parse(script.textContent);
-      const pr = data?.payload?.pullRequestsLayoutRoute?.pullRequest;
-      if (!pr) return { raw: data };
-      return {
-        title:        pr.title,
-        number:       pr.number,
-        state:        pr.state,
-        author:       pr.author?.login || pr.author,
-        baseBranch:   pr.baseBranch,
-        headBranch:   pr.headBranch,
-        id:           pr.id,
-        relayId:      pr.relayId || null,
-        commitsCount: pr.commitsCount,
-        mergedBy:     pr.mergedByName || null,
-        mergedTime:   pr.mergedTime || null,
-      };
-    } catch {
-      return null;
+    let meta = null;
+    if (script) {
+      try {
+        const data = JSON.parse(script.textContent);
+        const pr = data?.payload?.pullRequestsLayoutRoute?.pullRequest;
+        if (pr) {
+          meta = {
+            title: pr.title, number: pr.number, state: pr.state,
+            author: pr.author?.login || pr.author,
+            baseBranch: pr.baseBranch, headBranch: pr.headBranch,
+            id: pr.id, relayId: pr.relayId || null,
+            commitsCount: pr.commitsCount,
+            mergedBy: pr.mergedByName || null, mergedTime: pr.mergedTime || null,
+          };
+        }
+      } catch {}
     }
+    if (!meta) meta = {};
+
+    // DOM state override — embedded JSON is stale/cached
+    const stateBadge = $(".State, [title='Status: Open'], [title='Status: Closed'], [title='Status: Merged']");
+    if (stateBadge) {
+      const bt = clean(stateBadge.textContent).toLowerCase();
+      if (bt.includes("closed")) meta.state = "CLOSED";
+      else if (bt.includes("merged")) meta.state = "MERGED";
+      else if (bt.includes("draft")) meta.state = "DRAFT";
+      else if (bt.includes("open")) meta.state = "OPEN";
+    }
+    const headerState = $(".gh-header-meta .State");
+    if (headerState) {
+      const hs = clean(headerState.textContent).toLowerCase();
+      if (hs.includes("closed")) meta.state = "CLOSED";
+      else if (hs.includes("merged")) meta.state = "MERGED";
+      else if (hs.includes("draft")) meta.state = "DRAFT";
+      else if (hs.includes("open")) meta.state = "OPEN";
+    }
+    if ($(".gh-header-meta .State--merged, .State--purple")) meta.state = "MERGED";
+    if ($(".gh-header-meta .State--closed, .State--red")) meta.state = "CLOSED";
+
+    return meta;
   }
 
   // ── 2. Extract a comment block ─────────────────────────────────────
@@ -97,26 +116,15 @@
   function extractComment(container) {
     const authorEl = $("a.author", container);
     const author = authorEl ? clean(authorEl.textContent) : null;
-
     const botBadge = $(".Label--secondary", container);
     const isBot = botBadge ? clean(botBadge.textContent).toLowerCase() === "bot" : false;
-
     const timeEl = $("relative-time", container);
-    const timestamp = timeEl
-      ? timeEl.getAttribute("datetime") || clean(timeEl.textContent)
-      : null;
-
+    const timestamp = timeEl ? timeEl.getAttribute("datetime") || clean(timeEl.textContent) : null;
     const authorLabel = $(".Label.ml-1", container);
     const role = authorLabel ? clean(authorLabel.textContent) : null;
-
-    const bodyEl =
-      $(".comment-body.markdown-body", container) ||
-      $(".comment-body", container) ||
-      $(".markdown-body", container);
+    const bodyEl = $(".comment-body.markdown-body", container) || $(".comment-body", container) || $(".markdown-body", container);
     const body = richText(bodyEl);
-
     if (!body && !author) return null;
-
     const entry = { author, timestamp, body };
     if (isBot) entry.isBot = true;
     if (role) entry.role = role;
@@ -128,53 +136,28 @@
   function findFilePath(el) {
     const dpEl = $("[data-path]", el);
     if (dpEl) return dpEl.getAttribute("data-path");
-
     const fileLink = $("a[href*='#diff-'], a.Link--primary[title]", el);
-    if (fileLink) {
-      const t = fileLink.getAttribute("title") || clean(fileLink.textContent);
-      if (t && t.includes("/")) return t;
-    }
-
+    if (fileLink) { const t = fileLink.getAttribute("title") || clean(fileLink.textContent); if (t && t.includes("/")) return t; }
     const summaryEl = $("summary", el) || $(".file-info", el);
-    if (summaryEl) {
-      const m = clean(summaryEl.textContent).match(/[\w-]+\/[\w./-]+\.\w+/);
-      if (m) return m[0];
-    }
-
-    for (const a of $$("a", el)) {
-      const text = clean(a.textContent);
-      if (text.match(/^[\w-]+\/[\w./-]+\.\w+$/) && text.length > 5) return text;
-    }
-
+    if (summaryEl) { const m = clean(summaryEl.textContent).match(/[\w-]+\/[\w./-]+\.\w+/); if (m) return m[0]; }
+    for (const a of $$("a", el)) { const text = clean(a.textContent); if (text.match(/^[\w-]+\/[\w./-]+\.\w+$/) && text.length > 5) return text; }
     return null;
   }
 
-  // ── 4. Extract commit SHA from any container ───────────────────────
+  // ── 4. Commit SHA finder ───────────────────────────────────────────
 
   function findCommitSha(el) {
-    // GitHub uses /commits/SHA in PR context, /commit/SHA elsewhere
     for (const a of $$("a", el)) {
       const href = a.getAttribute("href") || "";
       const m = href.match(/\/commits?\/([0-9a-f]{7,40})/);
       if (m) return { sha: m[1], url: location.origin + href };
     }
-    // Fallback: code/tt/.sha elements
     const codeEl = $("code, tt, .sha", el);
-    if (codeEl) {
-      const text = clean(codeEl.textContent);
-      if (/^[0-9a-f]{7,40}$/.test(text)) return { sha: text, url: null };
-    }
+    if (codeEl) { const text = clean(codeEl.textContent); if (/^[0-9a-f]{7,40}$/.test(text)) return { sha: text, url: null }; }
     return null;
   }
 
-  // ── 5. Parse severity/priority labels from body text ───────────────
-  // P1/P2/Security/High Priority etc are rendered as markdown text by
-  // review bots, not as GitHub Label DOM elements.
-
-  // Badge alt text patterns from bot review comments (discovered via DOM investigation):
-  //   Codex:  <img alt="P1 Badge">, <img alt="P2 Badge">
-  //   Gemini: <img alt="security-high">, <img alt="high">, <img alt="medium">
-  // These are shields.io badge images rendered inside .comment-body
+  // ── 5. Badge labels from img alt text ──────────────────────────────
 
   const BADGE_PATTERNS = [
     { re: /^P([0-4])\s*(?:Badge)?$/i,       fn: m => [`P${m[1]}`] },
@@ -186,42 +169,68 @@
 
   function extractBadgeLabels(commentEl) {
     const labels = [];
-    const imgs = $$("img", commentEl);
-    for (const img of imgs) {
+    for (const img of $$("img", commentEl)) {
       const alt = (img.getAttribute("alt") || "").trim();
-      if (!alt || alt.startsWith("@")) continue; // skip avatars
+      if (!alt || alt.startsWith("@")) continue;
       for (const pattern of BADGE_PATTERNS) {
         const m = alt.match(pattern.re);
-        if (m) {
-          for (const label of pattern.fn(m)) {
-            if (!labels.includes(label)) labels.push(label);
-          }
-          break;
-        }
+        if (m) { for (const l of pattern.fn(m)) { if (!labels.includes(l)) labels.push(l); } break; }
       }
     }
     return labels;
   }
 
-  // Strip badge alt text that leaked into body from richText img handling
-  function stripBadgeTextFromBody(body) {
+  // ── 6. Body text cleanup ───────────────────────────────────────────
+  // Strip badge alt text AND suggestion widget UI chrome from body
+
+  const SUGGESTION_CHROME_PATTERNS = [
+    /^Suggested change$/i,
+    /^Suggestion applied$/i,
+    /^Commit suggestion/i,
+    /^Pending in batch$/i,
+    /^Remove from batch$/i,
+    /^Commit suggestions?\d*$/i,
+    /^Commit changes$/i,
+    /^Add suggestion to batch$/i,
+    /^\|.*\|$/,  // table rows from inline diffs
+  ];
+
+  function stripBodyChrome(body) {
     if (!body) return body;
-    // Remove lines that are just badge alt text (at the start of body)
     const lines = body.split("\n");
+
+    // Strip leading badge alt text lines
     while (lines.length > 0) {
       const line = lines[0].trim();
       if (/^P[0-4]\s*Badge$/i.test(line) ||
           /^security[- ](high|medium|low|critical)$/i.test(line) ||
           /^(high|medium|low|critical)$/i.test(line)) {
         lines.shift();
-      } else {
-        break;
+      } else break;
+    }
+
+    // Strip trailing suggestion widget chrome
+    // Find the last occurrence of "Suggested change" and truncate from there
+    let cutIdx = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (/^Suggested change$/i.test(lines[i].trim())) {
+        cutIdx = i;
+        // Only cut if what follows looks like widget chrome (table rows, "Suggestion applied", etc.)
+        let chromeCount = 0;
+        for (let j = i + 1; j < lines.length && j < i + 15; j++) {
+          const l = lines[j].trim();
+          if (SUGGESTION_CHROME_PATTERNS.some(p => p.test(l)) || l === "") chromeCount++;
+        }
+        if (chromeCount >= 2) break; // confirmed widget chrome follows
+        else cutIdx = -1; // false positive, keep looking
       }
     }
+    if (cutIdx >= 0) lines.length = cutIdx;
+
     return lines.join("\n").trim();
   }
 
-  // ── 6. Extract review threads ──────────────────────────────────────
+  // ── 7. Extract review threads ──────────────────────────────────────
 
   function extractReviewThreads(container) {
     const turboFrames = $$('turbo-frame[id^="review-thread-or-comment-id-"]', container);
@@ -229,7 +238,6 @@
 
     for (const frame of turboFrames) {
       const details = $("details.review-thread-component", frame) || frame;
-
       const file = findFilePath(details);
 
       // Line numbers
@@ -237,35 +245,25 @@
       const blobNums = $$(".blob-num[data-line-number]", details);
       if (blobNums.length) {
         const nums = blobNums.map(el => parseInt(el.getAttribute("data-line-number"))).filter(n => !isNaN(n));
-        if (nums.length) {
-          lineStart = Math.min(...nums);
-          lineEnd = Math.max(...nums);
-        }
+        if (nums.length) { lineStart = Math.min(...nums); lineEnd = Math.max(...nums); }
       }
       if (!lineStart) {
         const headerText = clean((details.textContent || "").slice(0, 500));
         const lineMatch = headerText.match(/lines?\s*\+?(\d+)(?:\s*to\s*\+?(\d+))?/i);
-        if (lineMatch) {
-          lineStart = parseInt(lineMatch[1]);
-          if (lineMatch[2]) lineEnd = parseInt(lineMatch[2]);
-        }
+        if (lineMatch) { lineStart = parseInt(lineMatch[1]); if (lineMatch[2]) lineEnd = parseInt(lineMatch[2]); }
       }
 
       // Code context
       const codeEls = $$(".blob-code-inner, .js-file-line", details);
-      const codeContext = codeEls.length
-        ? codeEls.map(el => el.textContent.trimEnd()).join("\n").trim()
-        : null;
+      const codeContext = codeEls.length ? codeEls.map(el => el.textContent.trimEnd()).join("\n").trim() : null;
 
-      // Resolved — check the thread-level resolution marker
+      // Resolved
       const isResolved = details.hasAttribute("data-resolved") ||
         !!$(".timeline-comment-label-resolved, .js-resolved-badge", details) ||
         (details.tagName === "DETAILS" && !details.open && !!$("[data-resolved]", frame));
 
-      // Outdated — Label--warning with text "Outdated" (NOT "Pending in batch")
-      const outdatedEl = $$(".Label.Label--warning", details).find(el =>
-        clean(el.textContent) === "Outdated"
-      );
+      // Outdated
+      const outdatedEl = $$(".Label.Label--warning", details).find(el => clean(el.textContent) === "Outdated");
       const isOutdated = !!outdatedEl;
 
       // Comments
@@ -276,72 +274,53 @@
       for (const c of commentEls) {
         if (seen.has(c)) continue;
         seen.add(c);
-
         const entry = extractComment(c);
         if (!entry) continue;
 
-        // Extract severity/priority from badge images in the comment DOM
+        // Badge labels from img elements
         const badgeLabels = extractBadgeLabels(c);
         if (badgeLabels.length) entry.labels = badgeLabels;
 
-        // Strip badge alt text that leaked into body
-        entry.body = stripBadgeTextFromBody(entry.body);
+        // Clean body — strip badge text AND suggestion widget chrome
+        entry.body = stripBodyChrome(entry.body);
 
-        // Suggested changes — clean diff only, no UI chrome
+        // Suggested changes — clean diff only
         const suggestionBlob = $(".js-suggested-changes-blob, .blob-wrapper.suggestion", c);
         if (suggestionBlob) {
-          const removedLines = $$(".blob-code-deletion .blob-code-inner", suggestionBlob)
-            .map(el => el.textContent.trimEnd());
-          const addedLines = $$(".blob-code-addition .blob-code-inner", suggestionBlob)
-            .map(el => el.textContent.trimEnd());
-
+          const removedLines = $$(".blob-code-deletion .blob-code-inner", suggestionBlob).map(el => el.textContent.trimEnd());
+          const addedLines = $$(".blob-code-addition .blob-code-inner", suggestionBlob).map(el => el.textContent.trimEnd());
           if (removedLines.length || addedLines.length) {
             entry.suggestedChange = {};
             if (removedLines.length) entry.suggestedChange.removed = removedLines;
             if (addedLines.length) entry.suggestedChange.added = addedLines;
           } else {
-            const codeText = $$(".blob-code-inner", suggestionBlob)
-              .map(el => el.textContent.trimEnd()).join("\n");
+            const codeText = $$(".blob-code-inner", suggestionBlob).map(el => el.textContent.trimEnd()).join("\n");
             if (codeText) entry.suggestedChange = { code: codeText };
           }
         }
 
         // Comment permalink
         const commentAnchor = $('[id^="issuecomment-"], [id^="discussion_r"]', c);
-        if (commentAnchor) {
-          entry.commentId = commentAnchor.id;
-          entry.permalink = makePermalink(commentAnchor.id);
-        }
+        if (commentAnchor) { entry.commentId = commentAnchor.id; entry.permalink = makePermalink(commentAnchor.id); }
 
         comments.push(entry);
       }
 
       if (comments.length) {
-        const thread = {
-          threadId: frame.id || null,
-          file: file,
-          resolved: isResolved,
-          outdated: isOutdated,
-          comments: comments,
-        };
-        if (lineStart) {
-          thread.lineStart = lineStart;
-          if (lineEnd && lineEnd !== lineStart) thread.lineEnd = lineEnd;
-        }
+        const thread = { threadId: frame.id || null, file, resolved: isResolved, outdated: isOutdated, comments };
+        if (lineStart) { thread.lineStart = lineStart; if (lineEnd && lineEnd !== lineStart) thread.lineEnd = lineEnd; }
         if (codeContext) thread.codeContext = codeContext;
         threads.push(thread);
       }
     }
-
     return threads;
   }
 
-  // ── 7. Walk the timeline ────────────────────────────────────────────
+  // ── 8. Walk the timeline ────────────────────────────────────────────
 
   function extractTimeline() {
     const discussion = $(".js-discussion");
     if (!discussion) return [];
-
     const items = [];
 
     // PR description
@@ -351,17 +330,12 @@
       if (desc) {
         desc.type = "pr-description";
         const issueEl = $('[id^="issue-"], [id^="pullrequest-"]', firstPartial);
-        if (issueEl) {
-          desc.elementId = issueEl.id;
-          desc.permalink = makePermalink(issueEl.id);
-        }
+        if (issueEl) { desc.elementId = issueEl.id; desc.permalink = makePermalink(issueEl.id); }
         items.push(desc);
       }
     }
 
-    // Timeline items
     const timelineEls = $$(".js-timeline-item", discussion);
-
     for (const tItem of timelineEls) {
 
       // Case A: Code review
@@ -371,14 +345,8 @@
         const author = $("a.author", reviewHeader);
         const timeEl = $("relative-time", reviewHeader);
         const botBadge = $(".Label--secondary", reviewHeader);
-
-        const summaryComment = extractComment(
-          $(".timeline-comment-group", tItem) || tItem
-        );
-
+        const summaryComment = extractComment($(".timeline-comment-group", tItem) || tItem);
         const reviewId = reviewEl.id || null;
-
-        // Review state
         let reviewState = null;
         const stateEl = $(".review-status-label, .State", tItem);
         if (stateEl) reviewState = clean(stateEl.textContent).toLowerCase();
@@ -387,30 +355,19 @@
           else if ($(".octicon-x, .color-fg-danger", tItem)) reviewState = "changes_requested";
           else reviewState = "commented";
         }
-
-        // Reviewed commit
         const commitInfo = findCommitSha(tItem);
-
         const threads = extractReviewThreads(tItem);
-
-        const entry = {
-          type: "review",
-          reviewId: reviewId,
-          reviewState: reviewState,
+        items.push({
+          type: "review", reviewId, reviewState,
           reviewedCommit: commitInfo?.sha || null,
           author: author ? clean(author.textContent) : summaryComment?.author,
-          timestamp: timeEl
-            ? timeEl.getAttribute("datetime") || clean(timeEl.textContent)
-            : summaryComment?.timestamp,
+          timestamp: timeEl ? timeEl.getAttribute("datetime") || clean(timeEl.textContent) : summaryComment?.timestamp,
           isBot: botBadge ? clean(botBadge.textContent).toLowerCase() === "bot" : false,
           permalink: makePermalink(reviewId),
           body: summaryComment?.body || null,
-          threadCount: threads.length,
-          unresolvedCount: threads.filter(t => !t.resolved).length,
-          threads: threads,
-        };
-
-        items.push(entry);
+          threadCount: threads.length, unresolvedCount: threads.filter(t => !t.resolved).length,
+          threads,
+        });
         continue;
       }
 
@@ -421,10 +378,7 @@
         if (entry) {
           entry.type = "comment";
           const groupId = commentGroup.id || "";
-          if (groupId.startsWith("issuecomment-")) {
-            entry.commentId = groupId;
-            entry.permalink = makePermalink(groupId);
-          }
+          if (groupId.startsWith("issuecomment-")) { entry.commentId = groupId; entry.permalink = makePermalink(groupId); }
           items.push(entry);
           continue;
         }
@@ -437,100 +391,59 @@
         if (text && !text.startsWith("reviewed")) {
           const evAuthor = $("a.author", eventBody);
           const evTime = $("relative-time", eventBody);
-
-          // Trim signature verification noise
           const verifiedIdx = text.indexOf("Verified");
           if (verifiedIdx > 0) text = text.slice(0, verifiedIdx).trim();
-
-          // Commit SHA — matches both /commit/SHA and /commits/SHA
           const commitInfo = findCommitSha(eventBody);
-
-          const repoPath = location.pathname.replace(/\/pull\/\d+.*/, "");
           const event = {
             type: "event",
             author: evAuthor ? clean(evAuthor.textContent) : null,
-            timestamp: evTime
-              ? evTime.getAttribute("datetime") || clean(evTime.textContent)
-              : null,
-            text: text,
+            timestamp: evTime ? evTime.getAttribute("datetime") || clean(evTime.textContent) : null,
+            text,
           };
-          if (commitInfo) {
-            event.commitSha = commitInfo.sha;
-            event.commitUrl = commitInfo.url || (location.origin + repoPath + "/commit/" + commitInfo.sha);
-          }
-
+          if (commitInfo) { event.commitSha = commitInfo.sha; event.commitUrl = commitInfo.url || (location.origin + location.pathname.replace(/\/pull\/\d+.*/, "") + "/commit/" + commitInfo.sha); }
           const targetEl = $("[id].js-targetable-element, [id].js-targetable-elem", tItem);
-          if (targetEl) {
-            event.elementId = targetEl.id;
-            event.permalink = makePermalink(targetEl.id);
-          }
-
+          if (targetEl) { event.elementId = targetEl.id; event.permalink = makePermalink(targetEl.id); }
           items.push(event);
         }
       }
     }
-
     return items;
   }
 
-  // ── 8. Sidebar — section-aware parsing ─────────────────────────────
+  // ── 9. Sidebar — section-aware ─────────────────────────────────────
 
   function extractSidebar() {
     const sidebar = $("#partial-discussion-sidebar");
     if (!sidebar) return null;
     const result = {};
-
-    // Walk each discussion-sidebar-item by heading
-    const sections = $$(".discussion-sidebar-item", sidebar);
-    for (const section of sections) {
+    for (const section of $$(".discussion-sidebar-item", sidebar)) {
       const headingEl = $(".discussion-sidebar-heading, .text-bold", section);
       const heading = headingEl ? clean(headingEl.textContent).toLowerCase() : "";
-
       if (heading === "reviewers") {
-        const names = $$(".css-truncate-target, .assignee", section)
-          .map(el => clean(el.textContent)).filter(Boolean);
+        const names = $$(".css-truncate-target, .assignee", section).map(el => clean(el.textContent)).filter(Boolean);
         if (names.length) result.reviewers = [...new Set(names)];
       }
-
       if (heading === "assignees") {
-        const names = $$(".css-truncate-target, .assignee", section)
-          .map(el => clean(el.textContent)).filter(Boolean);
-        // "No one" or empty means no assignees
-        const filtered = names.filter(n => !n.toLowerCase().includes("no one"));
-        if (filtered.length) result.assignees = [...new Set(filtered)];
+        const names = $$(".css-truncate-target, .assignee", section).map(el => clean(el.textContent)).filter(n => n && !n.toLowerCase().includes("no one"));
+        if (names.length) result.assignees = [...new Set(names)];
       }
-
       if (heading === "labels") {
-        const labels = $$(".IssueLabel, .js-issue-labels a", section)
-          .map(l => clean(l.textContent)).filter(Boolean);
+        const labels = $$(".IssueLabel, .js-issue-labels a", section).map(l => clean(l.textContent)).filter(Boolean);
         if (labels.length) result.labels = labels;
       }
-
       if (heading === "milestone") {
         const ms = $(".milestone-name, a", section);
-        if (ms) {
-          const text = clean(ms.textContent);
-          if (text && !text.toLowerCase().includes("no milestone") &&
-              !text.toLowerCase().includes("reload this page") &&
-              !text.toLowerCase().includes("uh oh")) result.milestone = text;
-        }
+        if (ms) { const t = clean(ms.textContent); if (t && !t.includes("No milestone") && !t.includes("reload this page") && !t.includes("Uh oh")) result.milestone = t; }
       }
-
       if (heading === "projects") {
-        const projs = $$("a", section).map(a => clean(a.textContent)).filter(Boolean);
-        const filtered = projs.filter(p =>
-          !p.toLowerCase().includes("none") &&
-          !p.toLowerCase().includes("reload this page") &&
-          !p.toLowerCase().includes("uh oh")
-        );
-        if (filtered.length) result.projects = filtered;
+        const projs = $$("a", section).map(a => clean(a.textContent)).filter(p => p && !p.includes("None") && !p.includes("reload this page") && !p.includes("Uh oh"));
+        if (projs.length) result.projects = projs;
       }
     }
-
     return Object.keys(result).length ? result : null;
   }
 
-  // ── 9. Checks status ──────────────────────────────────────────────
+  // ── 10. Checks ─────────────────────────────────────────────────────
 
   function extractChecks() {
     const heading = $(".status-heading, .h4.status-heading");
@@ -545,7 +458,7 @@
   const allThreads = reviews.flatMap(r => r.threads || []);
 
   return {
-    version: "1.6.0",
+    version: "1.8.0",
     exportedAt: new Date().toISOString(),
     url: location.href,
     pr: extractMetadata(),
@@ -558,7 +471,7 @@
       outdatedThreads: allThreads.filter(t => t.outdated).length,
       filesWithComments: [...new Set(allThreads.map(t => t.file).filter(Boolean))],
     },
-    timeline: timeline,
+    timeline,
     sidebar: extractSidebar(),
     checks: extractChecks(),
   };
